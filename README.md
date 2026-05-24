@@ -34,7 +34,7 @@ An AI-powered code review agent that:
 
 ## 🎥 Demo
 
-> 3-minute demo video → [Link to demo video]
+> 3-minute demo video → [[Link to demo video]](https://www.loom.com/share/c8a5ec67e73a4dec8048fca51941badd)
 
 **Sample review output (terminal):**
 
