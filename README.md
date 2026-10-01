@@ -1,6 +1,10 @@
 # 🔍 AI Code Review Assistant
 
-> **Hackathon Project** · Built in 24 hours · Powered by Groq + LLaMA 3.3 70B
+> **Hackathon Project** · Built in 24 hours, hardened afterwards · Powered by Groq + LLaMA 3.3 70B
+
+[![CI](https://github.com/Diksha159457/my-ai-project/actions/workflows/ci.yml/badge.svg)](https://github.com/Diksha159457/my-ai-project/actions/workflows/ci.yml)
+[![AI Code Review](https://github.com/Diksha159457/my-ai-project/actions/workflows/ai-review.yml/badge.svg)](https://github.com/Diksha159457/my-ai-project/actions/workflows/ai-review.yml)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)
 
 An AI agent that reviews git diffs and pull requests in real-time — detecting bugs, security vulnerabilities, performance bottlenecks, and code quality issues, then generating actionable fix suggestions instantly.
 
@@ -28,7 +32,7 @@ An AI-powered code review agent that:
 3. **Rates severity** — critical / high / medium / low per issue
 4. **Generates fix suggestions** — corrected code, not vague warnings
 5. **Scores the PR** — 0–100 quality score with overall assessment
-6. **Exits with error code** — CI/CD integration: fails the pipeline on critical issues
+6. **Comments on your PRs** — a GitHub Action posts a single sticky review comment and fails the check on blocking issues
 
 ---
 
@@ -73,7 +77,8 @@ An AI-powered code review agent that:
 | AI Model | LLaMA 3.3 70B via Groq API |
 | Inference | Groq LPU (1–2s responses) |
 | Web UI | Vanilla HTML/CSS/JS — zero dependencies |
-| CLI | Python 3.10+ |
+| CLI | Python 3.10+, Pydantic v2 |
+| API | Flask + Gunicorn |
 | Integration | Git CLI, CI/CD via exit codes |
 
 ---
@@ -91,58 +96,105 @@ Open `app.html` in any browser.
 ### Python CLI
 
 ```bash
-# Install
-pip install -r requirements.txt
-
-# Set API key
+pip install -e .             # installs the `ai-review` command
 export GROQ_API_KEY=gsk_...
 
-# Review your latest commit
-git diff HEAD~1 | python review.py
-
-# Review a specific diff file
-python review.py changes.diff
-
-# Review from a git base with language hint
-python review.py --git HEAD~2 --lang python
-
-# Save JSON report (for CI/CD pipelines)
-python review.py changes.diff --output report.json
+git diff HEAD~1 | ai-review                       # review latest commit
+ai-review changes.diff                            # review a diff file
+ai-review --git origin/main --lang python         # review against a base
+ai-review --git origin/main --format markdown     # PR-comment markdown
+ai-review changes.diff --output report.json --fail-on critical
 ```
 
-### CI/CD Integration (GitHub Actions)
+`python review.py …` still works as before.
 
-```yaml
-name: AI Code Review
-on: [pull_request]
+| Exit code | Meaning |
+|:--:|---|
+| `0` | No issue at or above `--fail-on` (default `high`) |
+| `1` | Blocking issues found — fails your pipeline |
+| `2` | Usage, configuration or provider error |
 
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+### HTTP API
 
-      - name: AI Code Review
-        run: |
-          pip install groq
-          git diff origin/main | python review.py
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+```bash
+pip install -e ".[server]"
+gunicorn app:app
+curl -X POST localhost:8000/review -H 'content-type: application/json' \
+     -d '{"diff": "...", "lang": "python"}'
 ```
 
-The CLI exits with code `1` if bugs or critical security issues are found — automatically fails your pipeline.
+Input is validated (400 on bad body, 413 over `MAX_DIFF_BYTES`), provider failures map to 502, and `/health` reports whether an API key is configured.
+
+### Automatic PR reviews (GitHub Actions)
+
+This repo reviews its own pull requests with [`.github/workflows/ai-review.yml`](.github/workflows/ai-review.yml):
+
+1. Add a `GROQ_API_KEY` repository secret.
+2. Open a PR. The action reviews `base...HEAD`, posts **one sticky comment** (updated on every push, never duplicated), uploads `report.json` as an artifact, and fails the check on high/critical issues.
+
+Copy the workflow into any repo to get the same behaviour. Without the secret (e.g. PRs from forks) the job skips cleanly instead of failing.
+
+---
+
+## 🏗 Architecture
+
+```
+            diff (stdin / file / git)
+                     │
+             ┌───────▼────────┐
+             │  diff.py       │  split per file · drop lockfiles
+             │  chunk_diff()  │  pack into ≤24k-char chunks
+             └───────┬────────┘
+                     │  one LLM call per chunk
+             ┌───────▼────────┐
+             │  engine.py     │  diff wrapped as untrusted <diff>
+             │  review_diff() │  retry w/ self-repair on bad JSON,
+             └───────┬────────┘  exponential backoff on API errors
+                     │
+             ┌───────▼────────┐
+             │  schema.py     │  Pydantic: normalise enums, clamp score
+             │  Review.merge  │  merge chunks (worst score wins)
+             └───────┬────────┘
+          ┌──────────┼───────────┐
+     terminal     markdown      JSON / HTTP
+```
+
+### Design decisions
+
+- **Chunk by file, not by bytes.** Large PRs exceed the context window; splitting on `diff --git` boundaries keeps hunks intact so the model never reviews half a function.
+- **Validate, don't trust.** LLMs drift (`"Critical"`, `"score": "85"`, stray code fences). A Pydantic schema normalises the output so downstream code (exit codes, PR comments) is deterministic.
+- **Self-repair retries.** On malformed JSON the next attempt tells the model what went wrong, instead of blindly re-sending the same prompt.
+- **Prompt-injection hygiene.** The diff is fenced in `<diff>` tags and the system prompt tells the model to ignore instructions inside it, so a PR can't talk its way to a perfect score.
+- **Injected LLM client.** The engine takes any `(system, user, model) -> str` callable, so the whole pipeline is tested offline and can be pointed at any provider.
 
 ---
 
 ## 📁 Project Structure
 
 ```
-ai-code-reviewer/
-├── app.html          # Web UI — single file, no build step
-├── review.py         # Python CLI
-├── requirements.txt  # Python deps (groq)
-└── README.md
+├── ai_reviewer/
+│   ├── cli.py        # `ai-review` command, exit-code policy
+│   ├── diff.py       # diff stats, per-file split, chunking
+│   ├── engine.py     # prompt, LLM call, retries, merge
+│   ├── render.py     # terminal + GitHub markdown renderers
+│   └── schema.py     # Pydantic Review / Issue models
+├── app.py            # Flask HTTP API (Render)
+├── app.html          # Web UI, single file, no build step
+├── review.py         # legacy entry point → ai_reviewer.cli
+├── tests/            # 30 offline tests (fake LLM client)
+└── .github/workflows/
+    ├── ci.yml        # ruff + pytest on 3.10–3.12
+    └── ai-review.yml # reviews every PR, sticky comment
+```
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -e ".[dev]"
+ruff check . && ruff format --check .
+pytest --cov=ai_reviewer        # 30 tests, ~91% coverage, no network needed
 ```
 
 ---
@@ -155,7 +207,8 @@ ai-code-reviewer/
 - **Quality score** — 0–100 PR health score with animated ring
 - **Split-pane UI** — diff editor left, live results right
 - **Terminal colors** — readable output in any terminal
-- **CI/CD ready** — non-zero exit on critical issues
+- **CI/CD ready** — configurable `--fail-on` threshold, sticky PR comments
+- **Large-PR safe** — per-file chunking, lockfiles skipped automatically
 - **Zero frontend deps** — `app.html` is a single self-contained file
 - **JSON export** — `--output report.json` for integrations
 - **Multiple input modes** — stdin pipe / file / `--git BASE`
@@ -173,7 +226,8 @@ ai-code-reviewer/
 
 ## 🔮 Future Roadmap
 
-- [ ] GitHub PR comment integration (post reviews directly to PR)
+- [x] GitHub PR comment integration (post reviews directly to PR)
+- [ ] Inline review comments on exact diff lines
 - [ ] GitLab / Bitbucket webhooks
 - [ ] Custom rule sets per team / codebase
 - [ ] Historical score tracking across PRs

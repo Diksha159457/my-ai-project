@@ -1,0 +1,82 @@
+name: AI Code Review
+
+# Reviews every pull request with the assistant itself and posts (or updates)
+# a single sticky comment. Requires a GROQ_API_KEY repository secret; the job
+# is skipped cleanly when the secret is absent (e.g. PRs from forks).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip when no API key is configured
+        if: env.GROQ_API_KEY == ''
+        run: echo "::notice::GROQ_API_KEY secret not set — skipping AI review."
+
+      - uses: actions/setup-python@v5
+        if: env.GROQ_API_KEY != ''
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Run review
+        if: env.GROQ_API_KEY != ''
+        id: review
+        run: |
+          pip install -e .
+          set +e
+          ai-review --git "origin/${{ github.base_ref }}...HEAD" \
+            --format markdown --output report.json > comment.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Post or update PR comment
+        if: env.GROQ_API_KEY != '' && hashFiles('comment.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            if (!body.trim()) return;
+            const marker = '<!-- ai-code-review -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const mine = comments.find(c => c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - uses: actions/upload-artifact@v4
+        if: env.GROQ_API_KEY != ''
+        with:
+          name: ai-review-report
+          path: report.json
+          if-no-files-found: ignore
+
+      - name: Fail on blocking issues
+        if: steps.review.outputs.exit_code == '1'
+        run: |
+          echo "::error::AI review found high/critical issues — see the PR comment."
+          exit 1
